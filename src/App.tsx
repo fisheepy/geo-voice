@@ -31,18 +31,18 @@ const IS_WEB = Capacitor.getPlatform() === "web";
 
 type Note = {
   id: string;
-  filePath: string; // native URI (for Filesystem)
-  webPath: string; // for <audio src>
+  filePath: string; // native path (web: our virtual path)
+  webPath: string;  // data: or blob: url for <audio>
   createdAt: string; // ISO
   lat: number;
   lon: number;
-  label?: string; // simple label (date/time or user-provided later)
+  label?: string;
   durationMs?: number;
   mimeType?: string;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Local persistence helpers (Notes JSON index + audio files)
+// Local persistence (JSON index + audio files)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const NOTES_INDEX = "notesIndex.json";
@@ -53,8 +53,7 @@ async function readNotes(): Promise<Note[]> {
     const raw = res.data as unknown; // string | Blob (web)
     const text = typeof raw === "string" ? raw : await (raw as Blob).text();
     return JSON.parse(text) as Note[];
-  } catch (e) {
-    // file not found yet
+  } catch {
     return [];
   }
 }
@@ -96,8 +95,86 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
+function canPlay(mime: string): boolean {
+  const a = document.createElement("audio");
+  // 'probably' or 'maybe' are both acceptable
+  return !!(a && a.canPlayType && a.canPlayType(mime));
+}
+
+const CANDIDATE_TYPES = [
+  // Prefer types most likely to be playable by the current browser
+  "audio/mp4;codecs=mp4a.40.2", // Safari
+  "audio/mp4",                   // Safari
+  "audio/aac",                   // Safari
+  "audio/webm;codecs=opus",      // Chrome
+  "audio/webm",
+  "audio/ogg;codecs=opus",       // Firefox
+  "audio/ogg",
+];
+
+function pickSupportedType(): string {
+  // Cross-check what MediaRecorder can emit AND <audio> can play
+  // @ts-ignore
+  const MR: typeof MediaRecorder | undefined = (typeof window !== "undefined" ? (window as any).MediaRecorder : undefined);
+  if (!MR || typeof MR.isTypeSupported !== "function") return "";
+  for (const t of CANDIDATE_TYPES) {
+    try {
+      if (MR.isTypeSupported(t) && canPlay(t)) return t;
+    } catch {}
+  }
+  return ""; // no mutually-supported type → use WAV fallback
+}
+
+function mimeToExt(m: string): string {
+  if (!m) return "webm";
+  if (m.includes("mp4")) return "m4a"; // good generic ext for audio/mp4
+  if (m.includes("aac")) return "aac";
+  if (m.includes("ogg")) return "ogg";
+  return "webm";
+}
+
+// WAV encoder (16-bit PCM, mono)
+function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
+  const numChannels = 1;
+  const bytesPerSample = 2; // 16-bit
+  const blockAlign = numChannels * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = samples.length * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  // RIFF header
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(view, 8, "WAVE");
+  // fmt chunk
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true); // PCM chunk size
+  view.setUint16(20, 1, true);  // audio format = PCM
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true); // bits per sample
+  // data chunk
+  writeString(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  // PCM samples
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return buffer;
+}
+
+function writeString(view: DataView, offset: number, s: string) {
+  for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Minimalist UI Bits
+// Minimalist UI
 // ─────────────────────────────────────────────────────────────────────────────
 
 const Screen: React.FC<React.PropsWithChildren<{ title?: string }>> = ({ title, children }) => (
@@ -125,7 +202,7 @@ const TabBar: React.FC<{ tab: "record" | "map"; onChange: (t: "record" | "map") 
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Record View
+// Record View (type negotiation + WAV fallback)
 // ─────────────────────────────────────────────────────────────────────────────
 
 type UIStatus = "IDLE" | "RECORDING" | "SAVED" | "FAILED_TO_RECORD";
@@ -138,12 +215,20 @@ const RecordView: React.FC<{ onSaved: (n: Note) => void }> = ({ onSaved }) => {
   const timerRef = useRef<number | null>(null);
   const positionRef = useRef<{ lat: number; lon: number } | null>(null);
 
-  // Web fallback recorder
+  // MediaRecorder path
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaChunksRef = useRef<Blob[]>([]);
+  const mimeTypeRef = useRef<string>("");
 
-  // prefetch current location on mount (best effort)
+  // WAV fallback path
+  const wavUseFallbackRef = useRef(false);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const procNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const pcmBuffersRef = useRef<Float32Array[]>([]);
+  const sampleRateRef = useRef<number>(44100);
+
   useEffect(() => {
     (async () => {
       try {
@@ -174,41 +259,51 @@ const RecordView: React.FC<{ onSaved: (n: Note) => void }> = ({ onSaved }) => {
   const start = async () => {
     try {
       setStatus(null);
-
-      // location snapshot at start (best effort)
+      // snapshot location (best effort)
       try {
         const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true });
         positionRef.current = { lat: pos.coords.latitude, lon: pos.coords.longitude };
       } catch {}
 
       if (IS_WEB) {
-        // Web path: use MediaRecorder
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const mr = new MediaRecorder(stream);
-        mediaChunksRef.current = [];
-        mr.ondataavailable = (e) => {
-          if (e.data && e.data.size) mediaChunksRef.current.push(e.data);
-        };
-        mr.start();
-        mediaRecorderRef.current = mr;
-        mediaStreamRef.current = stream;
-        setIsRecording(true);
-        setUiStatus("RECORDING");
-        setElapsed(0);
-        startTimer();
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+        const chosen = pickSupportedType();
+        if (chosen) {
+          mimeTypeRef.current = chosen;
+          const mr = new MediaRecorder(stream, { mimeType: chosen });
+          mediaChunksRef.current = [];
+          mr.ondataavailable = (e) => { if (e.data && e.data.size) mediaChunksRef.current.push(e.data); };
+          mr.start();
+          mediaRecorderRef.current = mr;
+          mediaStreamRef.current = stream;
+          wavUseFallbackRef.current = false;
+        } else {
+          // WAV fallback: collect PCM via Web Audio
+          const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+          const source = ctx.createMediaStreamSource(stream);
+          const proc = ctx.createScriptProcessor(4096, 1, 1);
+          pcmBuffersRef.current = [];
+          sampleRateRef.current = ctx.sampleRate;
+          proc.onaudioprocess = (ev) => {
+            const ch0 = ev.inputBuffer.getChannelData(0);
+            pcmBuffersRef.current.push(new Float32Array(ch0)); // copy slice
+          };
+          source.connect(proc); proc.connect(ctx.destination);
+          audioCtxRef.current = ctx; sourceNodeRef.current = source; procNodeRef.current = proc;
+          mediaStreamRef.current = stream;
+          wavUseFallbackRef.current = true;
+          mimeTypeRef.current = "audio/wav";
+        }
+        setIsRecording(true); setUiStatus("RECORDING"); setElapsed(0); startTimer();
         return;
       }
 
-      // Native path: plugin
+      // Native path
       await VoiceRecorder.requestAudioRecordingPermission();
       await VoiceRecorder.startRecording();
-      setIsRecording(true);
-      setUiStatus("RECORDING");
-      setElapsed(0);
-      startTimer();
+      setIsRecording(true); setUiStatus("RECORDING"); setElapsed(0); startTimer();
     } catch (err) {
-      setUiStatus("FAILED_TO_RECORD");
-      setStatus("FAILED_TO_RECORD");
+      setUiStatus("FAILED_TO_RECORD"); setStatus("FAILED_TO_RECORD");
     }
   };
 
@@ -217,34 +312,33 @@ const RecordView: React.FC<{ onSaved: (n: Note) => void }> = ({ onSaved }) => {
       stopTimer();
 
       if (IS_WEB) {
-        const mr = mediaRecorderRef.current;
-        if (!mr) throw new Error("No recorder");
+        let blob: Blob;
+        if (!wavUseFallbackRef.current) {
+          // MediaRecorder stop → blob
+          const mr = mediaRecorderRef.current; if (!mr) throw new Error("No recorder");
+          const finished = new Promise<Blob>((resolve) => { mr.onstop = () => resolve(new Blob(mediaChunksRef.current, { type: mimeTypeRef.current || "audio/webm" })); });
+          mr.stop();
+          blob = await finished;
+        } else {
+          // WAV fallback stop → encode PCM
+          procNodeRef.current?.disconnect(); sourceNodeRef.current?.disconnect();
+          audioCtxRef.current && (await audioCtxRef.current.close());
+          mediaStreamRef.current?.getTracks().forEach(t => t.stop());
+          const totalLen = pcmBuffersRef.current.reduce((sum, b) => sum + b.length, 0);
+          const merged = new Float32Array(totalLen);
+          let offset = 0; for (const b of pcmBuffersRef.current) { merged.set(b, offset); offset += b.length; }
+          const wavBuf = encodeWav(merged, sampleRateRef.current);
+          blob = new Blob([wavBuf], { type: "audio/wav" });
+        }
 
-        const finished = new Promise<Blob>((resolve) => {
-          mr.onstop = () => resolve(new Blob(mediaChunksRef.current, { type: "audio/webm" }));
-        });
-        mr.stop();
-        const blob = await finished;
-
-        // Release tracks
-        mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
-        mediaRecorderRef.current = null;
-        mediaStreamRef.current = null;
-
-        // Persist audio
+        // Persist + build data URL for playback
         const arrayBuffer = await blob.arrayBuffer();
         const base64 = arrayBufferToBase64(arrayBuffer);
         const id = uuidv4();
-        const filename = `audio/${id}.webm`;
+        const ext = !wavUseFallbackRef.current ? mimeToExt(blob.type) : "wav";
+        const filename = `audio/${id}.${ext}`;
         await Filesystem.writeFile({ path: filename, directory: Directory.Data, data: base64, recursive: true });
-
-        let webPath = "";
-        try {
-          const fileUri = await Filesystem.getUri({ path: filename, directory: Directory.Data });
-          webPath = Capacitor.convertFileSrc(fileUri.uri);
-        } catch {
-          webPath = URL.createObjectURL(blob); // fallback for web play
-        }
+        const webPath = `data:${blob.type};base64,${base64}`; // always playable in current browser
 
         const note: Note = {
           id,
@@ -255,84 +349,43 @@ const RecordView: React.FC<{ onSaved: (n: Note) => void }> = ({ onSaved }) => {
           lon: positionRef.current?.lon ?? 0,
           label: new Date().toLocaleString(),
           durationMs: elapsed,
-          mimeType: "audio/webm",
+          mimeType: blob.type,
         };
-
         const existing = await readNotes();
         await writeNotes([note, ...existing]);
+        setIsRecording(false); setUiStatus("SAVED"); setStatus("Saved");
         onSaved(note);
-        setIsRecording(false);
-        setUiStatus("SAVED");
-        setStatus("Saved");
-        setTimeout(() => setStatus(null), 1500);
+        setTimeout(() => setStatus(null), 1200);
         return;
       }
 
       // Native (plugin)
       const result = await VoiceRecorder.stopRecording();
       setIsRecording(false);
-
-      const rawBase64 = result?.value?.recordDataBase64;
-      const ms = result?.value?.msDuration as number | undefined;
-      const mime = (result?.value?.mimeType as string | undefined) || "audio/m4a";
-      if (!rawBase64) throw new Error("No audio data");
-
+      const rawBase64 = result?.value?.recordDataBase64; const ms = result?.value?.msDuration as number | undefined; const mime = (result?.value?.mimeType as string | undefined) || "audio/m4a"; if (!rawBase64) throw new Error("No audio data");
       const base64 = toBase64Standard(rawBase64);
-      const id = uuidv4();
-      const ext = mime.includes("mp3") ? "mp3" : mime.includes("wav") ? "wav" : "m4a";
+      const id = uuidv4(); const ext = mime.includes("mp3") ? "mp3" : mime.includes("wav") ? "wav" : "m4a";
       const filename = `audio/${id}.${ext}`;
       await Filesystem.writeFile({ path: filename, directory: Directory.Data, data: base64, recursive: true });
       const fileUri = await Filesystem.getUri({ path: filename, directory: Directory.Data });
       const webPath = Capacitor.convertFileSrc(fileUri.uri);
-
-      if (!positionRef.current) {
-        try {
-          const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true });
-          positionRef.current = { lat: pos.coords.latitude, lon: pos.coords.longitude };
-        } catch {}
-      }
-
-      const note: Note = {
-        id,
-        filePath: filename,
-        webPath,
-        createdAt: new Date().toISOString(),
-        lat: positionRef.current?.lat ?? 0,
-        lon: positionRef.current?.lon ?? 0,
-        label: new Date().toLocaleString(),
-        durationMs: ms ?? elapsed,
-        mimeType: mime,
-      };
-
-      const existing = await readNotes();
-      await writeNotes([note, ...existing]);
-      onSaved(note);
-      setUiStatus("SAVED");
-      setStatus("Saved");
-      setTimeout(() => setStatus(null), 1500);
+      if (!positionRef.current) { try { const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true }); positionRef.current = { lat: pos.coords.latitude, lon: pos.coords.longitude }; } catch {} }
+      const note: Note = { id, filePath: filename, webPath, createdAt: new Date().toISOString(), lat: positionRef.current?.lat ?? 0, lon: positionRef.current?.lon ?? 0, label: new Date().toLocaleString(), durationMs: ms ?? elapsed, mimeType: mime };
+      const existing = await readNotes(); await writeNotes([note, ...existing]);
+      setUiStatus("SAVED"); setStatus("Saved"); onSaved(note); setTimeout(() => setStatus(null), 1200);
     } catch (err) {
-      setIsRecording(false);
-      setUiStatus("FAILED_TO_RECORD");
-      setStatus("FAILED_TO_RECORD");
-      setTimeout(() => setStatus(null), 2000);
+      setIsRecording(false); setUiStatus("FAILED_TO_RECORD"); setStatus("FAILED_TO_RECORD"); setTimeout(() => setStatus(null), 1800);
     }
   };
 
   return (
     <Screen title="New Voice Memo">
-      <div className="text-xs text-neutral-400">
-        {uiStatus === "RECORDING" ? "Recording…" : uiStatus === "FAILED_TO_RECORD" ? "FAILED_TO_RECORD" : status || ""}
-      </div>
-      <button
-        onClick={isRecording ? stop : start}
-        className={`w-40 h-40 rounded-full flex items-center justify-center shadow-xl transition active:scale-95 border ${
-          isRecording ? "bg-red-600 border-red-500 text-white" : "bg-neutral-800 border-neutral-700 text-neutral-100"
-        }`}
-      >
+      <div className="text-xs text-neutral-400">{uiStatus === "RECORDING" ? "Recording…" : uiStatus === "FAILED_TO_RECORD" ? (status || "FAILED_TO_RECORD") : status || ""}</div>
+      <button onClick={isRecording ? stop : start} className={`w-40 h-40 rounded-full flex items-center justify-center shadow-xl transition active:scale-95 border ${isRecording ? "bg-red-600 border-red-500 text-white" : "bg-neutral-800 border-neutral-700 text-neutral-100"}`}>
         <div className="text-lg font-semibold">{isRecording ? "Stop" : "Record"}</div>
       </button>
       <div className="h-6 text-sm text-neutral-400">{isRecording ? msToClock(elapsed) : ""}</div>
-      <p className="text-center text-xs text-neutral-500 px-6">Tip: we snapshot your location when you start/stop for better accuracy.</p>
+      <p className="text-center text-xs text-neutral-500 px-6">Tip: on Safari we auto-switch to WAV so playback always works.</p>
     </Screen>
   );
 };
@@ -343,20 +396,13 @@ const RecordView: React.FC<{ onSaved: (n: Note) => void }> = ({ onSaved }) => {
 
 const Recenter: React.FC<{ lat: number; lon: number }> = ({ lat, lon }) => {
   const map = useMap();
-  useEffect(() => {
-    map.setView([lat, lon]);
-  }, [lat, lon]);
+  useEffect(() => { map.setView([lat, lon]); }, [lat, lon]);
   return null;
 };
 
 const FitBounds: React.FC<{ points: [number, number][] }> = ({ points }) => {
   const map = useMap();
-  useEffect(() => {
-    if (points && points.length > 0) {
-      const bounds = L.latLngBounds(points.map(([la, lo]) => L.latLng(la, lo)));
-      map.fitBounds(bounds, { padding: [40, 40] });
-    }
-  }, [JSON.stringify(points)]);
+  useEffect(() => { if (points && points.length > 0) { const bounds = L.latLngBounds(points.map(([la, lo]) => L.latLng(la, lo))); map.fitBounds(bounds, { padding: [40, 40] }); } }, [JSON.stringify(points)]);
   return null;
 };
 
@@ -364,30 +410,21 @@ const MapView: React.FC<{ notes: Note[] }> = ({ notes }) => {
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true });
-        setCoords({ lat: pos.coords.latitude, lon: pos.coords.longitude });
-      } catch {
-        setCoords(null);
-      }
-    })();
-  }, []);
+  useEffect(() => { (async () => { try { const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true }); setCoords({ lat: pos.coords.latitude, lon: pos.coords.longitude }); } catch { setCoords(null); } })(); }, []);
 
   const located = useMemo(() => notes.filter(n => !(n.lat === 0 && n.lon === 0)), [notes]);
   const unlocated = useMemo(() => notes.filter(n => (n.lat === 0 && n.lon === 0)), [notes]);
 
-  const center = useMemo<[number, number]>(() => {
-    if (coords) return [coords.lat, coords.lon];
-    if (located.length > 0) return [located[0].lat, located[0].lon];
-    return [42.2808, -83.743]; // Ann Arbor default
-  }, [coords, located]);
+  const center = useMemo<[number, number]>(() => { if (coords) return [coords.lat, coords.lon]; if (located.length > 0) return [located[0].lat, located[0].lon]; return [42.2808, -83.743]; }, [coords, located]);
 
   const onPlay = (note: Note) => {
     if (!audioRef.current) return;
-    audioRef.current.src = note.webPath;
-    audioRef.current.play();
+    const a = audioRef.current;
+    a.pause();
+    a.src = note.webPath; // always data: on web; native path on device
+    a.currentTime = 0;
+    a.load();
+    a.play().catch((err) => console.warn("play failed:", err));
   };
 
   return (
@@ -395,28 +432,15 @@ const MapView: React.FC<{ notes: Note[] }> = ({ notes }) => {
       <header className="p-4 text-center font-medium text-neutral-200 tracking-wide">Your Memos</header>
       <div className="flex-1 relative">
         <MapContainer center={[42.2808, -83.743]} zoom={13} style={{height:'70vh', width:'100%'}}>
-          <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          />
+          <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
           <Recenter lat={center[0]} lon={center[1]} />
-          {located.length > 0 && (
-            <FitBounds points={located.map(n => [n.lat, n.lon]) as [number, number][]} />
-          )}
-
+          {located.length > 0 && (<FitBounds points={located.map(n => [n.lat, n.lon]) as [number, number][]} />)}
           {located.map((n) => (
             <Marker key={n.id} position={[n.lat, n.lon]}>
               <Popup>
                 <div className="text-sm font-medium mb-1">{n.label || new Date(n.createdAt).toLocaleString()}</div>
-                <div className="text-xs text-neutral-500 mb-2">
-                  {n.mimeType?.replace("audio/", "").toUpperCase()} · {n.durationMs ? msToClock(n.durationMs) : ""}
-                </div>
-                <button
-                  onClick={() => onPlay(n)}
-                  className="px-3 py-1 rounded bg-neutral-900 border border-neutral-700 text-neutral-100 text-sm"
-                >
-                  Play
-                </button>
+                <div className="text-xs text-neutral-500 mb-2">{n.mimeType?.replace("audio/", "").toUpperCase()} · {n.durationMs ? msToClock(n.durationMs) : ""}</div>
+                <button onClick={() => onPlay(n)} className="px-3 py-1 rounded bg-neutral-900 border border-neutral-700 text-neutral-100 text-sm">Play</button>
               </Popup>
             </Marker>
           ))}
@@ -424,16 +448,8 @@ const MapView: React.FC<{ notes: Note[] }> = ({ notes }) => {
 
         {unlocated.length > 0 && (
           <div className="absolute left-3 right-3 bottom-20 bg-neutral-900/90 border border-neutral-700 rounded-xl p-3 text-sm">
-            <div className="mb-2">
-              Saved {unlocated.length} memo{unlocated.length>1?'s':''} without location. They won't show on the map until location is allowed. You can still play them here:
-            </div>
-            <div className="flex gap-2 flex-wrap">
-              {unlocated.slice(0, 5).map((n) => (
-                <button key={n.id} onClick={() => onPlay(n)} className="px-3 py-1 rounded border border-neutral-700 hover:bg-neutral-800">
-                  {n.label || new Date(n.createdAt).toLocaleString()}
-                </button>
-              ))}
-            </div>
+            <div className="mb-2">Saved {unlocated.length} memo{unlocated.length>1?'s':''} without location. They won't show on the map until location is allowed. You can still play them here:</div>
+            <div className="flex gap-2 flex-wrap">{unlocated.slice(0, 5).map((n) => (<button key={n.id} onClick={() => onPlay(n)} className="px-3 py-1 rounded border border-neutral-700 hover:bg-neutral-800">{n.label || new Date(n.createdAt).toLocaleString()}</button>))}</div>
           </div>
         )}
 
@@ -444,23 +460,15 @@ const MapView: React.FC<{ notes: Note[] }> = ({ notes }) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// App Shell (two views)
+// App Shell
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function App() {
   const [tab, setTab] = useState<"record" | "map">("record");
   const [notes, setNotes] = useState<Note[]>([]);
 
-  useEffect(() => {
-    (async () => {
-      const n = await readNotes();
-      setNotes(n);
-    })();
-  }, []);
-
-  const handleSaved = async (note: Note) => {
-    setNotes((p) => [note, ...p]);
-  };
+  useEffect(() => { (async () => { const n = await readNotes(); setNotes(n); })(); }, []);
+  const handleSaved = async (note: Note) => setNotes((p) => [note, ...p]);
 
   return (
     <div className="relative min-h-screen bg-neutral-950">
@@ -471,22 +479,8 @@ export default function App() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Setup Notes (README-style)
+// Notes
 // ─────────────────────────────────────────────────────────────────────────────
-// 1) Install deps:
-//    npm i react react-dom uuid @capacitor/core @capacitor/geolocation @capacitor/filesystem capacitor-voice-recorder react-leaflet leaflet 
-//    npm i -D @types/leaflet
-//    npx cap add ios && npx cap add android
-//
-// 2) iOS Info.plist entries:
-//    - NSMicrophoneUsageDescription ("This app records voice memos.")
-//    - NSLocationWhenInUseUsageDescription ("Used to tag memos with your location.")
-//
-// 3) AndroidManifest.xml permissions:
-//    - <uses-permission android:name="android.permission.RECORD_AUDIO" />
-//    - <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-//    - <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-//
-// 4) Web testing notes:
-//    - Chrome recommended. Web uses MediaRecorder + WebM; Safari support varies.
-//    - If playback fails, ensure you clicked Play (autoplay restrictions).
+// • On the web, we now pick a recording type that the current browser can BOTH record and play.
+// • If none fits (common on Safari), we fall back to WAV via Web Audio, which <audio> can always play.
+// • We store a data: URL for playback on web so Vite/dev works without native file serving.
