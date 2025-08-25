@@ -9,7 +9,6 @@ import { v4 as uuidv4 } from "uuid";
 import "leaflet/dist/leaflet.css";
 import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
 import * as L from "leaflet";
-// Leaflet default marker asset fix for bundlers
 // @ts-ignore
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
 // @ts-ignore
@@ -17,13 +16,17 @@ import markerIcon from "leaflet/dist/images/marker-icon.png";
 // @ts-ignore
 import markerShadow from "leaflet/dist/images/marker-shadow.png";
 
-L.Icon.Default.mergeOptions({
-  iconRetinaUrl: markerIcon2x,
-  iconUrl: markerIcon,
-  shadowUrl: markerShadow,
-});
+L.Icon.Default.mergeOptions({ iconRetinaUrl: markerIcon2x, iconUrl: markerIcon, shadowUrl: markerShadow });
 
-const IS_WEB = Capacitor.getPlatform() === "web";
+// ─────────────────────────────────────────────────────────────────────────────
+// Platform flags & debug
+// ─────────────────────────────────────────────────────────────────────────────
+const PLATFORM = Capacitor.getPlatform();
+const IS_WEB = PLATFORM === "web";
+const IS_IOS = PLATFORM === "ios";
+const BUILD_SENTINEL = "GV_DEBUG_2025_08_24_C"; // bump to prove fresh build
+const BUILD_TIME = new Date().toISOString();
+const dbgIOS = (...a: any[]) => console.log("[DEBUG][iOS]", ...a);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -31,9 +34,9 @@ const IS_WEB = Capacitor.getPlatform() === "web";
 
 type Note = {
   id: string;
-  filePath: string; // native path (web: our virtual path)
-  webPath: string;  // data: or blob: url for <audio>
-  createdAt: string; // ISO
+  filePath: string;
+  webPath: string;
+  createdAt: string;
   lat: number;
   lon: number;
   label?: string;
@@ -41,8 +44,10 @@ type Note = {
   mimeType?: string;
 };
 
+type UIStatus = "IDLE" | "RECORDING" | "SAVED" | "FAILED_TO_RECORD";
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Local persistence (JSON index + audio files)
+// Local persistence
 // ─────────────────────────────────────────────────────────────────────────────
 
 const NOTES_INDEX = "notesIndex.json";
@@ -59,13 +64,7 @@ async function readNotes(): Promise<Note[]> {
 }
 
 async function writeNotes(notes: Note[]): Promise<void> {
-  await Filesystem.writeFile({
-    path: NOTES_INDEX,
-    data: JSON.stringify(notes),
-    directory: Directory.Data,
-    encoding: Encoding.UTF8,
-    recursive: true,
-  });
+  await Filesystem.writeFile({ path: NOTES_INDEX, data: JSON.stringify(notes), directory: Directory.Data, encoding: Encoding.UTF8, recursive: true });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,215 +94,129 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
-function canPlay(mime: string): boolean {
-  const a = document.createElement("audio");
-  // 'probably' or 'maybe' are both acceptable
-  return !!(a && a.canPlayType && a.canPlayType(mime));
-}
-
-const CANDIDATE_TYPES = [
-  // Prefer types most likely to be playable by the current browser
-  "audio/mp4;codecs=mp4a.40.2", // Safari
-  "audio/mp4",                   // Safari
-  "audio/aac",                   // Safari
-  "audio/webm;codecs=opus",      // Chrome
-  "audio/webm",
-  "audio/ogg;codecs=opus",       // Firefox
-  "audio/ogg",
-];
-
-function pickSupportedType(): string {
-  // Cross-check what MediaRecorder can emit AND <audio> can play
-  // @ts-ignore
-  const MR: typeof MediaRecorder | undefined = (typeof window !== "undefined" ? (window as any).MediaRecorder : undefined);
-  if (!MR || typeof MR.isTypeSupported !== "function") return "";
-  for (const t of CANDIDATE_TYPES) {
-    try {
-      if (MR.isTypeSupported(t) && canPlay(t)) return t;
-    } catch {}
-  }
-  return ""; // no mutually-supported type → use WAV fallback
-}
-
 function mimeToExt(m: string): string {
   if (!m) return "webm";
-  if (m.includes("mp4")) return "m4a"; // good generic ext for audio/mp4
+  if (m.includes("mp4")) return "m4a";
   if (m.includes("aac")) return "aac";
   if (m.includes("ogg")) return "ogg";
+  if (m.includes("wav")) return "wav";
   return "webm";
-}
-
-// WAV encoder (16-bit PCM, mono)
-function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
-  const numChannels = 1;
-  const bytesPerSample = 2; // 16-bit
-  const blockAlign = numChannels * bytesPerSample;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = samples.length * bytesPerSample;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
-
-  // RIFF header
-  writeString(view, 0, "RIFF");
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(view, 8, "WAVE");
-  // fmt chunk
-  writeString(view, 12, "fmt ");
-  view.setUint32(16, 16, true); // PCM chunk size
-  view.setUint16(20, 1, true);  // audio format = PCM
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 16, true); // bits per sample
-  // data chunk
-  writeString(view, 36, "data");
-  view.setUint32(40, dataSize, true);
-
-  // PCM samples
-  let offset = 44;
-  for (let i = 0; i < samples.length; i++, offset += 2) {
-    let s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-  }
-  return buffer;
-}
-
-function writeString(view: DataView, offset: number, s: string) {
-  for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Minimalist UI
 // ─────────────────────────────────────────────────────────────────────────────
 
-const Screen: React.FC<React.PropsWithChildren<{ title?: string }>> = ({ title, children }) => (
+const Screen: React.FC<React.PropsWithChildren<{ title?: string; debugLine?: string }>> = ({ title, debugLine, children }) => (
   <div className="min-h-screen bg-neutral-950 text-neutral-50 flex flex-col">
-    <header className="p-4 text-center font-medium text-neutral-200 tracking-wide">{title}</header>
+    <header className="p-4 text-center font-medium text-neutral-200 tracking-wide">
+      {title} <span className="text-xs text-neutral-500">({BUILD_SENTINEL} · {BUILD_TIME.slice(11,19)})</span>
+      {debugLine ? (<div className="mt-2 text-xs text-neutral-500">{debugLine}</div>) : null}
+    </header>
     <main className="flex-1 flex flex-col items-center justify-center gap-4 p-4">{children}</main>
   </div>
 );
 
 const TabBar: React.FC<{ tab: "record" | "map"; onChange: (t: "record" | "map") => void }> = ({ tab, onChange }) => (
   <nav className="fixed bottom-0 left-0 right-0 h-16 bg-neutral-900 border-t border-neutral-800 grid grid-cols-2">
-    <button
-      className={`text-sm ${tab === "record" ? "text-white" : "text-neutral-400"}`}
-      onClick={() => onChange("record")}
-    >
-      Record
-    </button>
-    <button
-      className={`text-sm ${tab === "map" ? "text-white" : "text-neutral-400"}`}
-      onClick={() => onChange("map")}
-    >
-      Map
-    </button>
+    <button className={`text-sm ${tab === "record" ? "text-white" : "text-neutral-400"}`} onClick={() => onChange("record")}>Record</button>
+    <button className={`text-sm ${tab === "map" ? "text-white" : "text-neutral-400"}`} onClick={() => onChange("map")}>Map</button>
   </nav>
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Record View (type negotiation + WAV fallback)
+// Record View (iOS native + diagnostics)
 // ─────────────────────────────────────────────────────────────────────────────
-
-type UIStatus = "IDLE" | "RECORDING" | "SAVED" | "FAILED_TO_RECORD";
 
 const RecordView: React.FC<{ onSaved: (n: Note) => void }> = ({ onSaved }) => {
   const [isRecording, setIsRecording] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [status, setStatus] = useState<string | null>(null);
   const [uiStatus, setUiStatus] = useState<UIStatus>("IDLE");
+  const [debugLine, setDebugLine] = useState("loading…");
+  const [showDiag, setShowDiag] = useState(false);
   const timerRef = useRef<number | null>(null);
   const positionRef = useRef<{ lat: number; lon: number } | null>(null);
 
-  // MediaRecorder path
+  // Web recorder
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaChunksRef = useRef<Blob[]>([]);
   const mimeTypeRef = useRef<string>("");
 
-  // WAV fallback path
-  const wavUseFallbackRef = useRef(false);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const procNodeRef = useRef<ScriptProcessorNode | null>(null);
-  const pcmBuffersRef = useRef<Float32Array[]>([]);
-  const sampleRateRef = useRef<number>(44100);
-
+  // Prefetch location & capability debug
   useEffect(() => {
     (async () => {
-      try {
-        const perm = await Geolocation.checkPermissions();
-        if (perm.location !== "granted") {
-          await Geolocation.requestPermissions();
-        }
-        const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true });
-        positionRef.current = { lat: pos.coords.latitude, lon: pos.coords.longitude };
-      } catch {
-        // ignore; user can still record without GNSS
-      }
+      try { const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true }); positionRef.current = { lat: pos.coords.latitude, lon: pos.coords.longitude }; } catch {}
+      const pluginAvailable = (Capacitor as any).isPluginAvailable?.("VoiceRecorder") ?? false;
+      // @ts-ignore
+      const hasMD = !!navigator.mediaDevices; // often false in WKWebView
+      // @ts-ignore
+      const hasGUM = !!navigator.mediaDevices?.getUserMedia;
+      let inputs = 0; try { // @ts-ignore
+        const devs = hasMD && navigator.mediaDevices.enumerateDevices ? await navigator.mediaDevices.enumerateDevices() : [];
+        inputs = devs ? devs.filter((d: any) => d.kind === "audioinput").length : 0; } catch {}
+      console.log("[DEBUG] sentinel:", BUILD_SENTINEL);
+      console.log("[DEBUG] platform=", PLATFORM, "plugin=", pluginAvailable, "hasMD=", hasMD, "hasGUM=", hasGUM, "inputs=", inputs);
+      setDebugLine(`platform=${PLATFORM} plugin=${pluginAvailable} hasMD=${hasMD} hasGUM=${hasGUM} inputs=${inputs}`);
     })();
   }, []);
 
-  const startTimer = () => {
-    const start = Date.now();
-    timerRef.current = window.setInterval(() => {
-      setElapsed(Date.now() - start);
-    }, 200) as unknown as number;
-  };
-
-  const stopTimer = () => {
-    if (timerRef.current) window.clearInterval(timerRef.current);
-    timerRef.current = null;
-  };
+  const startTimer = () => { const t0 = Date.now(); timerRef.current = window.setInterval(() => setElapsed(Date.now() - t0), 200) as unknown as number; };
+  const stopTimer  = () => { if (timerRef.current) window.clearInterval(timerRef.current); timerRef.current = null; };
 
   const start = async () => {
     try {
       setStatus(null);
-      // snapshot location (best effort)
-      try {
-        const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true });
-        positionRef.current = { lat: pos.coords.latitude, lon: pos.coords.longitude };
-      } catch {}
+      try { const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true }); positionRef.current = { lat: pos.coords.latitude, lon: pos.coords.longitude }; } catch {}
 
-      if (IS_WEB) {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-        const chosen = pickSupportedType();
-        if (chosen) {
-          mimeTypeRef.current = chosen;
-          const mr = new MediaRecorder(stream, { mimeType: chosen });
-          mediaChunksRef.current = [];
-          mr.ondataavailable = (e) => { if (e.data && e.data.size) mediaChunksRef.current.push(e.data); };
-          mr.start();
-          mediaRecorderRef.current = mr;
-          mediaStreamRef.current = stream;
-          wavUseFallbackRef.current = false;
-        } else {
-          // WAV fallback: collect PCM via Web Audio
-          const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-          const source = ctx.createMediaStreamSource(stream);
-          const proc = ctx.createScriptProcessor(4096, 1, 1);
-          pcmBuffersRef.current = [];
-          sampleRateRef.current = ctx.sampleRate;
-          proc.onaudioprocess = (ev) => {
-            const ch0 = ev.inputBuffer.getChannelData(0);
-            pcmBuffersRef.current.push(new Float32Array(ch0)); // copy slice
-          };
-          source.connect(proc); proc.connect(ctx.destination);
-          audioCtxRef.current = ctx; sourceNodeRef.current = source; procNodeRef.current = proc;
-          mediaStreamRef.current = stream;
-          wavUseFallbackRef.current = true;
-          mimeTypeRef.current = "audio/wav";
+      if (IS_IOS) {
+        const available = (Capacitor as any).isPluginAvailable?.("VoiceRecorder") ?? false;
+        dbgIOS("pluginAvailable?", available, "typeof startRecording:", typeof (VoiceRecorder as any)?.startRecording);
+        if (!available || typeof (VoiceRecorder as any)?.startRecording !== "function") {
+          setUiStatus("FAILED_TO_RECORD"); setStatus("IOS_PLUGIN_NOT_LINKED"); return;
         }
-        setIsRecording(true); setUiStatus("RECORDING"); setElapsed(0); startTimer();
-        return;
+        try {
+          const has = await VoiceRecorder.hasAudioRecordingPermission(); dbgIOS("hasMic?", has);
+          if (!has.value) { const asked = await VoiceRecorder.requestAudioRecordingPermission(); dbgIOS("askedMic?", asked); if (!asked.value) { setUiStatus("FAILED_TO_RECORD"); setStatus("IOS_MIC_PERMISSION_DENIED"); return; } }
+        } catch (permErr) { dbgIOS("permission error", permErr); }
+        try {
+          dbgIOS("calling startRecording →");
+          await VoiceRecorder.startRecording();
+          dbgIOS("← startRecording resolved");
+          setIsRecording(true); setUiStatus("RECORDING"); setElapsed(0); startTimer();
+          return;
+        } catch (e: any) {
+          dbgIOS("startRecording error", e); setUiStatus("FAILED_TO_RECORD"); setStatus(e?.message || "IOS_START_ERROR"); return;
+        }
       }
 
-      // Native path
-      await VoiceRecorder.requestAudioRecordingPermission();
-      await VoiceRecorder.startRecording();
-      setIsRecording(true); setUiStatus("RECORDING"); setElapsed(0); startTimer();
-    } catch (err) {
-      setUiStatus("FAILED_TO_RECORD"); setStatus("FAILED_TO_RECORD");
+      if (IS_WEB) {
+        // Web path
+        // @ts-ignore
+        const hasMR = typeof window !== "undefined" && !!window.MediaRecorder;
+        if (!hasMR) { setUiStatus("FAILED_TO_RECORD"); setStatus("WEB_NO_MEDIARECORDER"); return; }
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+        const a = document.createElement("audio");
+        const candidates = ["audio/mp4;codecs=mp4a.40.2","audio/webm;codecs=opus","audio/webm","audio/ogg;codecs=opus","audio/ogg"]; 
+        const chosen = (() => { // pick a type we can also play
+          // @ts-ignore
+          const MR: any = window.MediaRecorder;
+          for (const t of candidates) { try { if (MR.isTypeSupported?.(t) && !!a.canPlayType(t)) return t; } catch {} }
+          return "";
+        })();
+        mimeTypeRef.current = chosen || "audio/webm";
+        const mr = chosen ? new MediaRecorder(stream, { mimeType: chosen }) : new MediaRecorder(stream);
+        mediaChunksRef.current = []; mr.ondataavailable = (e) => { if (e.data && e.data.size) mediaChunksRef.current.push(e.data); };
+        mr.start(); mediaRecorderRef.current = mr; mediaStreamRef.current = stream;
+        setIsRecording(true); setUiStatus("RECORDING"); setElapsed(0); startTimer(); return;
+      }
+
+      // Android native (similar to iOS plugin)
+      const has = await VoiceRecorder.hasAudioRecordingPermission(); if (!has.value) { const asked = await VoiceRecorder.requestAudioRecordingPermission(); if (!asked.value) { setUiStatus("FAILED_TO_RECORD"); setStatus("MIC_PERMISSION_DENIED"); return; } }
+      await VoiceRecorder.startRecording(); setIsRecording(true); setUiStatus("RECORDING"); setElapsed(0); startTimer();
+    } catch (err: any) {
+      setUiStatus("FAILED_TO_RECORD"); setStatus(err?.message || "FAILED_TO_RECORD");
     }
   };
 
@@ -311,122 +224,114 @@ const RecordView: React.FC<{ onSaved: (n: Note) => void }> = ({ onSaved }) => {
     try {
       stopTimer();
 
-      if (IS_WEB) {
-        let blob: Blob;
-        if (!wavUseFallbackRef.current) {
-          // MediaRecorder stop → blob
-          const mr = mediaRecorderRef.current; if (!mr) throw new Error("No recorder");
-          const finished = new Promise<Blob>((resolve) => { mr.onstop = () => resolve(new Blob(mediaChunksRef.current, { type: mimeTypeRef.current || "audio/webm" })); });
-          mr.stop();
-          blob = await finished;
-        } else {
-          // WAV fallback stop → encode PCM
-          procNodeRef.current?.disconnect(); sourceNodeRef.current?.disconnect();
-          audioCtxRef.current && (await audioCtxRef.current.close());
-          mediaStreamRef.current?.getTracks().forEach(t => t.stop());
-          const totalLen = pcmBuffersRef.current.reduce((sum, b) => sum + b.length, 0);
-          const merged = new Float32Array(totalLen);
-          let offset = 0; for (const b of pcmBuffersRef.current) { merged.set(b, offset); offset += b.length; }
-          const wavBuf = encodeWav(merged, sampleRateRef.current);
-          blob = new Blob([wavBuf], { type: "audio/wav" });
+      if (IS_IOS) {
+        const available = (Capacitor as any).isPluginAvailable?.("VoiceRecorder") ?? false;
+        dbgIOS("stop: pluginAvailable?", available);
+        if (!available) { setUiStatus("FAILED_TO_RECORD"); setStatus("IOS_PLUGIN_NOT_LINKED"); return; }
+        try {
+          dbgIOS("calling stopRecording →");
+          const result = await VoiceRecorder.stopRecording();
+          dbgIOS("← stopRecording resolved", { hasData: !!result?.value?.recordDataBase64, ms: result?.value?.msDuration, mime: result?.value?.mimeType });
+          setIsRecording(false);
+          const rawBase64 = result?.value?.recordDataBase64; const ms = result?.value?.msDuration as number | undefined; const mime = (result?.value?.mimeType as string | undefined) || "audio/m4a";
+          if (!rawBase64) throw new Error("No audio data");
+          const base64 = toBase64Standard(rawBase64);
+          const id = uuidv4(); const ext = mimeToExt(mime);
+          const filename = `audio/${id}.${ext}`;
+          await Filesystem.writeFile({ path: filename, directory: Directory.Data, data: base64, recursive: true });
+          const fileUri = await Filesystem.getUri({ path: filename, directory: Directory.Data });
+          const webPath = Capacitor.convertFileSrc(fileUri.uri);
+          const note: Note = { id, filePath: filename, webPath, createdAt: new Date().toISOString(), lat: positionRef.current?.lat ?? 0, lon: positionRef.current?.lon ?? 0, label: new Date().toLocaleString(), durationMs: ms ?? elapsed, mimeType: mime };
+          const existing = await readNotes(); await writeNotes([note, ...existing]); setUiStatus("SAVED"); setStatus("Saved"); onSaved(note); setTimeout(() => setStatus(null), 1200);
+          return;
+        } catch (e: any) {
+          dbgIOS("stopRecording error", e); setIsRecording(false); setUiStatus("FAILED_TO_RECORD"); setStatus(e?.message || "IOS_STOP_ERROR"); return;
         }
+      }
 
-        // Persist + build data URL for playback
-        const arrayBuffer = await blob.arrayBuffer();
-        const base64 = arrayBufferToBase64(arrayBuffer);
-        const id = uuidv4();
-        const ext = !wavUseFallbackRef.current ? mimeToExt(blob.type) : "wav";
-        const filename = `audio/${id}.${ext}`;
-        await Filesystem.writeFile({ path: filename, directory: Directory.Data, data: base64, recursive: true });
-        const webPath = `data:${blob.type};base64,${base64}`; // always playable in current browser
-
-        const note: Note = {
-          id,
-          filePath: filename,
-          webPath,
-          createdAt: new Date().toISOString(),
-          lat: positionRef.current?.lat ?? 0,
-          lon: positionRef.current?.lon ?? 0,
-          label: new Date().toLocaleString(),
-          durationMs: elapsed,
-          mimeType: blob.type,
-        };
-        const existing = await readNotes();
-        await writeNotes([note, ...existing]);
-        setIsRecording(false); setUiStatus("SAVED"); setStatus("Saved");
-        onSaved(note);
-        setTimeout(() => setStatus(null), 1200);
+      if (IS_WEB) {
+        const mr = mediaRecorderRef.current; if (!mr) throw new Error("No recorder");
+        const finished = new Promise<Blob>((resolve) => { mr.onstop = () => resolve(new Blob(mediaChunksRef.current, { type: mimeTypeRef.current || "audio/webm" })); });
+        mr.stop(); const blob = await finished; mediaStreamRef.current?.getTracks().forEach((t) => t.stop()); mediaRecorderRef.current = null; mediaStreamRef.current = null;
+        await persistBlobAsNote(blob, elapsed, positionRef.current, onSaved); setIsRecording(false); setUiStatus("SAVED"); setStatus("Saved"); setTimeout(() => setStatus(null), 1200);
         return;
       }
 
-      // Native (plugin)
-      const result = await VoiceRecorder.stopRecording();
-      setIsRecording(false);
-      const rawBase64 = result?.value?.recordDataBase64; const ms = result?.value?.msDuration as number | undefined; const mime = (result?.value?.mimeType as string | undefined) || "audio/m4a"; if (!rawBase64) throw new Error("No audio data");
-      const base64 = toBase64Standard(rawBase64);
-      const id = uuidv4(); const ext = mime.includes("mp3") ? "mp3" : mime.includes("wav") ? "wav" : "m4a";
-      const filename = `audio/${id}.${ext}`;
-      await Filesystem.writeFile({ path: filename, directory: Directory.Data, data: base64, recursive: true });
-      const fileUri = await Filesystem.getUri({ path: filename, directory: Directory.Data });
-      const webPath = Capacitor.convertFileSrc(fileUri.uri);
-      if (!positionRef.current) { try { const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true }); positionRef.current = { lat: pos.coords.latitude, lon: pos.coords.longitude }; } catch {} }
-      const note: Note = { id, filePath: filename, webPath, createdAt: new Date().toISOString(), lat: positionRef.current?.lat ?? 0, lon: positionRef.current?.lon ?? 0, label: new Date().toLocaleString(), durationMs: ms ?? elapsed, mimeType: mime };
-      const existing = await readNotes(); await writeNotes([note, ...existing]);
-      setUiStatus("SAVED"); setStatus("Saved"); onSaved(note); setTimeout(() => setStatus(null), 1200);
-    } catch (err) {
-      setIsRecording(false); setUiStatus("FAILED_TO_RECORD"); setStatus("FAILED_TO_RECORD"); setTimeout(() => setStatus(null), 1800);
+      // Android native
+      const result = await VoiceRecorder.stopRecording(); setIsRecording(false);
+      const rawBase64 = result?.value?.recordDataBase64; const ms = result?.value?.msDuration as number | undefined; const mime = (result?.value?.mimeType as string | undefined) || "audio/m4a";
+      if (!rawBase64) throw new Error("No audio data"); const base64 = toBase64Standard(rawBase64); const id = uuidv4(); const ext = mimeToExt(mime);
+      const filename = `audio/${id}.${ext}`; await Filesystem.writeFile({ path: filename, directory: Directory.Data, data: base64, recursive: true }); const fileUri = await Filesystem.getUri({ path: filename, directory: Directory.Data }); const webPath = Capacitor.convertFileSrc(fileUri.uri);
+      const note: Note = { id, filePath: filename, webPath, createdAt: new Date().toISOString(), lat: positionRef.current?.lat ?? 0, lon: positionRef.current?.lon ?? 0, label: new Date().toLocaleString(), durationMs: ms ?? elapsed, mimeType: mime }; const existing = await readNotes(); await writeNotes([note, ...existing]); onSaved(note); setUiStatus("SAVED"); setStatus("Saved"); setTimeout(() => setStatus(null), 1200);
+    } catch (err: any) { setIsRecording(false); setUiStatus("FAILED_TO_RECORD"); setStatus(err?.message || "FAILED_TO_RECORD"); setTimeout(() => setStatus(null), 1800); }
+  };
+
+  async function persistBlobAsNote(blob: Blob, elapsedMs: number, pos: {lat:number;lon:number} | null, onSavedCb: (n: Note)=>void) {
+    const arrayBuffer = await blob.arrayBuffer(); const base64 = arrayBufferToBase64(arrayBuffer); const id = uuidv4(); const ext = mimeToExt(blob.type);
+    const filename = `audio/${id}.${ext}`; await Filesystem.writeFile({ path: filename, directory: Directory.Data, data: base64, recursive: true }); const webPath = `data:${blob.type};base64,${base64}`;
+    const note: Note = { id, filePath: filename, webPath, createdAt: new Date().toISOString(), lat: pos?.lat ?? 0, lon: pos?.lon ?? 0, label: new Date().toLocaleString(), durationMs: elapsedMs, mimeType: blob.type };
+    const existing = await readNotes(); await writeNotes([note, ...existing]); onSavedCb(note);
+  }
+
+  // Diagnostics panel
+  const runNativeSmokeTest = async () => {
+    try {
+      const available = (Capacitor as any).isPluginAvailable?.("VoiceRecorder") ?? false;
+      setStatus(`SMOKE: plugin=${available}`);
+      if (!available) { setUiStatus("FAILED_TO_RECORD"); setStatus("SMOKE_FAIL: PLUGIN_NOT_LINKED"); return; }
+      const has = await VoiceRecorder.hasAudioRecordingPermission(); if (!has.value) { const asked = await VoiceRecorder.requestAudioRecordingPermission(); if (!asked.value) { setStatus("SMOKE_FAIL: MIC_DENIED"); return; } }
+      dbgIOS("SMOKE start →"); await VoiceRecorder.startRecording(); setStatus("SMOKE: recording 1s…"); await new Promise(r=>setTimeout(r, 1200));
+      const res = await VoiceRecorder.stopRecording(); dbgIOS("SMOKE stop ←", res);
+      const base = res?.value?.recordDataBase64; const ms = res?.value?.msDuration; const mime = res?.value?.mimeType; setStatus(`SMOKE_OK ms=${ms} mime=${mime} has=${!!base}`);
+    } catch (e: any) {
+      dbgIOS("SMOKE error", e); setStatus(`SMOKE_ERR: ${e?.message || e}`);
     }
   };
 
+  const requestMic = async () => {
+    try { const asked = await VoiceRecorder.requestAudioRecordingPermission(); setStatus(`PERM: asked=${asked.value}`); } catch (e: any) { setStatus(`PERM_ERR: ${e?.message || e}`); }
+  };
+
   return (
-    <Screen title="New Voice Memo">
+    <Screen title="New Voice Memo" debugLine={debugLine}>
       <div className="text-xs text-neutral-400">{uiStatus === "RECORDING" ? "Recording…" : uiStatus === "FAILED_TO_RECORD" ? (status || "FAILED_TO_RECORD") : status || ""}</div>
       <button onClick={isRecording ? stop : start} className={`w-40 h-40 rounded-full flex items-center justify-center shadow-xl transition active:scale-95 border ${isRecording ? "bg-red-600 border-red-500 text-white" : "bg-neutral-800 border-neutral-700 text-neutral-100"}`}>
         <div className="text-lg font-semibold">{isRecording ? "Stop" : "Record"}</div>
       </button>
       <div className="h-6 text-sm text-neutral-400">{isRecording ? msToClock(elapsed) : ""}</div>
-      <p className="text-center text-xs text-neutral-500 px-6">Tip: on Safari we auto-switch to WAV so playback always works.</p>
+
+      {/* Diagnostics toggle */}
+      <button onClick={() => setShowDiag(s => !s)} className="text-xs text-neutral-400 underline">{showDiag ? "Hide diagnostics" : "Show diagnostics"}</button>
+      {showDiag && (
+        <div className="w-full max-w-sm text-xs text-neutral-300 bg-neutral-900 border border-neutral-800 rounded-lg p-3 space-y-2">
+          <div>Build: {BUILD_SENTINEL} · {BUILD_TIME}</div>
+          <div>Platform: {PLATFORM}</div>
+          <div className="flex gap-2">
+            <button onClick={requestMic} className="px-2 py-1 rounded border border-neutral-700">Ask Mic</button>
+            <button onClick={runNativeSmokeTest} className="px-2 py-1 rounded border border-neutral-700">Native 1s Smoke</button>
+          </div>
+          <div className="text-neutral-400">Watch Xcode for [DEBUG][iOS] logs.</div>
+        </div>
+      )}
     </Screen>
   );
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Map View
+// Map View (unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const Recenter: React.FC<{ lat: number; lon: number }> = ({ lat, lon }) => {
-  const map = useMap();
-  useEffect(() => { map.setView([lat, lon]); }, [lat, lon]);
-  return null;
-};
-
-const FitBounds: React.FC<{ points: [number, number][] }> = ({ points }) => {
-  const map = useMap();
-  useEffect(() => { if (points && points.length > 0) { const bounds = L.latLngBounds(points.map(([la, lo]) => L.latLng(la, lo))); map.fitBounds(bounds, { padding: [40, 40] }); } }, [JSON.stringify(points)]);
-  return null;
-};
+const Recenter: React.FC<{ lat: number; lon: number }> = ({ lat, lon }) => { const map = useMap(); useEffect(() => { map.setView([lat, lon]); }, [lat, lon]); return null; };
+const FitBounds: React.FC<{ points: [number, number][] }> = ({ points }) => { const map = useMap(); useEffect(() => { if (points && points.length > 0) { const b = L.latLngBounds(points.map(([la, lo]) => L.latLng(la, lo))); map.fitBounds(b, { padding: [40, 40] }); } }, [JSON.stringify(points)]); return null; };
 
 const MapView: React.FC<{ notes: Note[] }> = ({ notes }) => {
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-
   useEffect(() => { (async () => { try { const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true }); setCoords({ lat: pos.coords.latitude, lon: pos.coords.longitude }); } catch { setCoords(null); } })(); }, []);
-
   const located = useMemo(() => notes.filter(n => !(n.lat === 0 && n.lon === 0)), [notes]);
   const unlocated = useMemo(() => notes.filter(n => (n.lat === 0 && n.lon === 0)), [notes]);
-
   const center = useMemo<[number, number]>(() => { if (coords) return [coords.lat, coords.lon]; if (located.length > 0) return [located[0].lat, located[0].lon]; return [42.2808, -83.743]; }, [coords, located]);
-
-  const onPlay = (note: Note) => {
-    if (!audioRef.current) return;
-    const a = audioRef.current;
-    a.pause();
-    a.src = note.webPath; // always data: on web; native path on device
-    a.currentTime = 0;
-    a.load();
-    a.play().catch((err) => console.warn("play failed:", err));
-  };
-
+  const onPlay = (note: Note) => { if (!audioRef.current) return; const a = audioRef.current; a.pause(); a.src = note.webPath; a.currentTime = 0; a.load(); a.play().catch(err => console.warn('play failed:', err)); };
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-50 flex flex-col">
       <header className="p-4 text-center font-medium text-neutral-200 tracking-wide">Your Memos</header>
@@ -445,14 +350,12 @@ const MapView: React.FC<{ notes: Note[] }> = ({ notes }) => {
             </Marker>
           ))}
         </MapContainer>
-
         {unlocated.length > 0 && (
           <div className="absolute left-3 right-3 bottom-20 bg-neutral-900/90 border border-neutral-700 rounded-xl p-3 text-sm">
             <div className="mb-2">Saved {unlocated.length} memo{unlocated.length>1?'s':''} without location. They won't show on the map until location is allowed. You can still play them here:</div>
             <div className="flex gap-2 flex-wrap">{unlocated.slice(0, 5).map((n) => (<button key={n.id} onClick={() => onPlay(n)} className="px-3 py-1 rounded border border-neutral-700 hover:bg-neutral-800">{n.label || new Date(n.createdAt).toLocaleString()}</button>))}</div>
           </div>
         )}
-
         <audio ref={audioRef} preload="none" />
       </div>
     </div>
@@ -466,10 +369,8 @@ const MapView: React.FC<{ notes: Note[] }> = ({ notes }) => {
 export default function App() {
   const [tab, setTab] = useState<"record" | "map">("record");
   const [notes, setNotes] = useState<Note[]>([]);
-
   useEffect(() => { (async () => { const n = await readNotes(); setNotes(n); })(); }, []);
-  const handleSaved = async (note: Note) => setNotes((p) => [note, ...p]);
-
+  const handleSaved = (note: Note) => setNotes((p) => [note, ...p]);
   return (
     <div className="relative min-h-screen bg-neutral-950">
       {tab === "record" ? <RecordView onSaved={handleSaved} /> : <MapView notes={notes} />}
@@ -477,10 +378,3 @@ export default function App() {
     </div>
   );
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Notes
-// ─────────────────────────────────────────────────────────────────────────────
-// • On the web, we now pick a recording type that the current browser can BOTH record and play.
-// • If none fits (common on Safari), we fall back to WAV via Web Audio, which <audio> can always play.
-// • We store a data: URL for playback on web so Vite/dev works without native file serving.
