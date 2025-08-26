@@ -1,3 +1,11 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { --app-height: 100dvh; }
+@supports not (height: 1dvh) { :root { --app-height: 100vh; } }
+html, body, #root { height: 100%; background: #0a0a0a; }
+
 :root {
   font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.5;
@@ -66,3 +74,4 @@ button:focus-visible {
     background-color: #f9f9f9;
   }
 }
+

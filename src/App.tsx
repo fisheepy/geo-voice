@@ -9,24 +9,18 @@ import { v4 as uuidv4 } from "uuid";
 import "leaflet/dist/leaflet.css";
 import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
 import * as L from "leaflet";
+// Fix Leaflet default marker assets in bundlers
 // @ts-ignore
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
 // @ts-ignore
 import markerIcon from "leaflet/dist/images/marker-icon.png";
 // @ts-ignore
 import markerShadow from "leaflet/dist/images/marker-shadow.png";
-
 L.Icon.Default.mergeOptions({ iconRetinaUrl: markerIcon2x, iconUrl: markerIcon, shadowUrl: markerShadow });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Platform flags & debug
-// ─────────────────────────────────────────────────────────────────────────────
-const PLATFORM = Capacitor.getPlatform();
-const IS_WEB = PLATFORM === "web";
-const IS_IOS = PLATFORM === "ios";
-const BUILD_SENTINEL = "GV_DEBUG_2025_08_24_C"; // bump to prove fresh build
-const BUILD_TIME = new Date().toISOString();
-const dbgIOS = (...a: any[]) => console.log("[DEBUG][iOS]", ...a);
+// Platform flags
+const IS_WEB = Capacitor.getPlatform() === "web";
+const BUILD_TAG = "FS_GRID_ROUND_v10"; // shows in header to confirm fresh build
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -34,9 +28,9 @@ const dbgIOS = (...a: any[]) => console.log("[DEBUG][iOS]", ...a);
 
 type Note = {
   id: string;
-  filePath: string;
-  webPath: string;
-  createdAt: string;
+  filePath: string; // native Filesystem path
+  webPath: string;  // browser-playable src
+  createdAt: string; // ISO
   lat: number;
   lon: number;
   label?: string;
@@ -47,7 +41,27 @@ type Note = {
 type UIStatus = "IDLE" | "RECORDING" | "SAVED" | "FAILED_TO_RECORD";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Local persistence
+// Full-screen helper for older iOS (sets --app-height to innerHeight)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function useAppHeight() {
+  useEffect(() => {
+    const set = () => document.documentElement.style
+      .setProperty("--app-height", `${window.innerHeight}px`);
+    set();
+    window.addEventListener("resize", set);
+    window.addEventListener("orientationchange", set);
+    window.addEventListener("pageshow", set);
+    return () => {
+      window.removeEventListener("resize", set);
+      window.removeEventListener("orientationchange", set);
+      window.removeEventListener("pageshow", set);
+    };
+  }, []);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Local persistence (Notes index + audio files)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const NOTES_INDEX = "notesIndex.json";
@@ -55,7 +69,7 @@ const NOTES_INDEX = "notesIndex.json";
 async function readNotes(): Promise<Note[]> {
   try {
     const res = await Filesystem.readFile({ path: NOTES_INDEX, directory: Directory.Data, encoding: Encoding.UTF8 });
-    const raw = res.data as unknown; // string | Blob (web)
+    const raw = res.data as unknown; // string | Blob
     const text = typeof raw === "string" ? raw : await (raw as Blob).text();
     return JSON.parse(text) as Note[];
   } catch {
@@ -100,32 +114,32 @@ function mimeToExt(m: string): string {
   if (m.includes("aac")) return "aac";
   if (m.includes("ogg")) return "ogg";
   if (m.includes("wav")) return "wav";
-  return "webm";
+  if (m.includes("webm")) return "webm";
+  return "m4a";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Minimalist UI
+// Minimal UI pieces
 // ─────────────────────────────────────────────────────────────────────────────
 
-const Screen: React.FC<React.PropsWithChildren<{ title?: string; debugLine?: string }>> = ({ title, debugLine, children }) => (
-  <div className="min-h-screen bg-neutral-950 text-neutral-50 flex flex-col">
-    <header className="p-4 text-center font-medium text-neutral-200 tracking-wide">
-      {title} <span className="text-xs text-neutral-500">({BUILD_SENTINEL} · {BUILD_TIME.slice(11,19)})</span>
-      {debugLine ? (<div className="mt-2 text-xs text-neutral-500">{debugLine}</div>) : null}
-    </header>
-    <main className="flex-1 flex flex-col items-center justify-center gap-4 p-4">{children}</main>
-  </div>
+const Header: React.FC<{ title: string }> = ({ title }) => (
+  <header className="pt-[env(safe-area-inset-top)] p-4 text-center font-medium text-neutral-200 tracking-wide">
+    {title} <span className="text-xs text-neutral-500">({BUILD_TAG})</span>
+  </header>
 );
 
 const TabBar: React.FC<{ tab: "record" | "map"; onChange: (t: "record" | "map") => void }> = ({ tab, onChange }) => (
-  <nav className="fixed bottom-0 left-0 right-0 h-16 bg-neutral-900 border-t border-neutral-800 grid grid-cols-2">
-    <button className={`text-sm ${tab === "record" ? "text-white" : "text-neutral-400"}`} onClick={() => onChange("record")}>Record</button>
-    <button className={`text-sm ${tab === "map" ? "text-white" : "text-neutral-400"}`} onClick={() => onChange("map")}>Map</button>
-  </nav>
+  <footer
+    className="bg-neutral-900 border-t border-neutral-800 grid grid-cols-2"
+    style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+  >
+    <button className={`h-16 text-sm ${tab === "record" ? "text-white" : "text-neutral-400"}`} onClick={() => onChange("record")}>Record</button>
+    <button className={`h-16 text-sm ${tab === "map" ? "text-white" : "text-neutral-400"}`} onClick={() => onChange("map")}>Map</button>
+  </footer>
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Record View (iOS native + diagnostics)
+// Record View (round button + color change)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const RecordView: React.FC<{ onSaved: (n: Note) => void }> = ({ onSaved }) => {
@@ -133,8 +147,6 @@ const RecordView: React.FC<{ onSaved: (n: Note) => void }> = ({ onSaved }) => {
   const [elapsed, setElapsed] = useState(0);
   const [status, setStatus] = useState<string | null>(null);
   const [uiStatus, setUiStatus] = useState<UIStatus>("IDLE");
-  const [debugLine, setDebugLine] = useState("loading…");
-  const [showDiag, setShowDiag] = useState(false);
   const timerRef = useRef<number | null>(null);
   const positionRef = useRef<{ lat: number; lon: number } | null>(null);
 
@@ -142,23 +154,16 @@ const RecordView: React.FC<{ onSaved: (n: Note) => void }> = ({ onSaved }) => {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaChunksRef = useRef<Blob[]>([]);
-  const mimeTypeRef = useRef<string>("");
 
-  // Prefetch location & capability debug
+  // Prefetch location once
   useEffect(() => {
     (async () => {
-      try { const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true }); positionRef.current = { lat: pos.coords.latitude, lon: pos.coords.longitude }; } catch {}
-      const pluginAvailable = (Capacitor as any).isPluginAvailable?.("VoiceRecorder") ?? false;
-      // @ts-ignore
-      const hasMD = !!navigator.mediaDevices; // often false in WKWebView
-      // @ts-ignore
-      const hasGUM = !!navigator.mediaDevices?.getUserMedia;
-      let inputs = 0; try { // @ts-ignore
-        const devs = hasMD && navigator.mediaDevices.enumerateDevices ? await navigator.mediaDevices.enumerateDevices() : [];
-        inputs = devs ? devs.filter((d: any) => d.kind === "audioinput").length : 0; } catch {}
-      console.log("[DEBUG] sentinel:", BUILD_SENTINEL);
-      console.log("[DEBUG] platform=", PLATFORM, "plugin=", pluginAvailable, "hasMD=", hasMD, "hasGUM=", hasGUM, "inputs=", inputs);
-      setDebugLine(`platform=${PLATFORM} plugin=${pluginAvailable} hasMD=${hasMD} hasGUM=${hasGUM} inputs=${inputs}`);
+      try {
+        const perm = await Geolocation.checkPermissions();
+        if (perm.location !== "granted") await Geolocation.requestPermissions();
+        const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true });
+        positionRef.current = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+      } catch {}
     })();
   }, []);
 
@@ -170,53 +175,21 @@ const RecordView: React.FC<{ onSaved: (n: Note) => void }> = ({ onSaved }) => {
       setStatus(null);
       try { const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true }); positionRef.current = { lat: pos.coords.latitude, lon: pos.coords.longitude }; } catch {}
 
-      if (IS_IOS) {
-        const available = (Capacitor as any).isPluginAvailable?.("VoiceRecorder") ?? false;
-        dbgIOS("pluginAvailable?", available, "typeof startRecording:", typeof (VoiceRecorder as any)?.startRecording);
-        if (!available || typeof (VoiceRecorder as any)?.startRecording !== "function") {
-          setUiStatus("FAILED_TO_RECORD"); setStatus("IOS_PLUGIN_NOT_LINKED"); return;
-        }
-        try {
-          const has = await VoiceRecorder.hasAudioRecordingPermission(); dbgIOS("hasMic?", has);
-          if (!has.value) { const asked = await VoiceRecorder.requestAudioRecordingPermission(); dbgIOS("askedMic?", asked); if (!asked.value) { setUiStatus("FAILED_TO_RECORD"); setStatus("IOS_MIC_PERMISSION_DENIED"); return; } }
-        } catch (permErr) { dbgIOS("permission error", permErr); }
-        try {
-          dbgIOS("calling startRecording →");
-          await VoiceRecorder.startRecording();
-          dbgIOS("← startRecording resolved");
-          setIsRecording(true); setUiStatus("RECORDING"); setElapsed(0); startTimer();
-          return;
-        } catch (e: any) {
-          dbgIOS("startRecording error", e); setUiStatus("FAILED_TO_RECORD"); setStatus(e?.message || "IOS_START_ERROR"); return;
-        }
-      }
-
       if (IS_WEB) {
-        // Web path
-        // @ts-ignore
-        const hasMR = typeof window !== "undefined" && !!window.MediaRecorder;
-        if (!hasMR) { setUiStatus("FAILED_TO_RECORD"); setStatus("WEB_NO_MEDIARECORDER"); return; }
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-        const a = document.createElement("audio");
-        const candidates = ["audio/mp4;codecs=mp4a.40.2","audio/webm;codecs=opus","audio/webm","audio/ogg;codecs=opus","audio/ogg"]; 
-        const chosen = (() => { // pick a type we can also play
-          // @ts-ignore
-          const MR: any = window.MediaRecorder;
-          for (const t of candidates) { try { if (MR.isTypeSupported?.(t) && !!a.canPlayType(t)) return t; } catch {} }
-          return "";
-        })();
-        mimeTypeRef.current = chosen || "audio/webm";
-        const mr = chosen ? new MediaRecorder(stream, { mimeType: chosen }) : new MediaRecorder(stream);
-        mediaChunksRef.current = []; mr.ondataavailable = (e) => { if (e.data && e.data.size) mediaChunksRef.current.push(e.data); };
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mr = new MediaRecorder(stream);
+        mediaChunksRef.current = [];
+        mr.ondataavailable = (e) => { if (e.data && e.data.size) mediaChunksRef.current.push(e.data); };
         mr.start(); mediaRecorderRef.current = mr; mediaStreamRef.current = stream;
         setIsRecording(true); setUiStatus("RECORDING"); setElapsed(0); startTimer(); return;
       }
 
-      // Android native (similar to iOS plugin)
-      const has = await VoiceRecorder.hasAudioRecordingPermission(); if (!has.value) { const asked = await VoiceRecorder.requestAudioRecordingPermission(); if (!asked.value) { setUiStatus("FAILED_TO_RECORD"); setStatus("MIC_PERMISSION_DENIED"); return; } }
-      await VoiceRecorder.startRecording(); setIsRecording(true); setUiStatus("RECORDING"); setElapsed(0); startTimer();
-    } catch (err: any) {
-      setUiStatus("FAILED_TO_RECORD"); setStatus(err?.message || "FAILED_TO_RECORD");
+      // Native (iOS/Android)
+      await VoiceRecorder.requestAudioRecordingPermission();
+      await VoiceRecorder.startRecording();
+      setIsRecording(true); setUiStatus("RECORDING"); setElapsed(0); startTimer();
+    } catch (err) {
+      setUiStatus("FAILED_TO_RECORD"); setStatus("FAILED_TO_RECORD");
     }
   };
 
@@ -224,101 +197,57 @@ const RecordView: React.FC<{ onSaved: (n: Note) => void }> = ({ onSaved }) => {
     try {
       stopTimer();
 
-      if (IS_IOS) {
-        const available = (Capacitor as any).isPluginAvailable?.("VoiceRecorder") ?? false;
-        dbgIOS("stop: pluginAvailable?", available);
-        if (!available) { setUiStatus("FAILED_TO_RECORD"); setStatus("IOS_PLUGIN_NOT_LINKED"); return; }
-        try {
-          dbgIOS("calling stopRecording →");
-          const result = await VoiceRecorder.stopRecording();
-          dbgIOS("← stopRecording resolved", { hasData: !!result?.value?.recordDataBase64, ms: result?.value?.msDuration, mime: result?.value?.mimeType });
-          setIsRecording(false);
-          const rawBase64 = result?.value?.recordDataBase64; const ms = result?.value?.msDuration as number | undefined; const mime = (result?.value?.mimeType as string | undefined) || "audio/m4a";
-          if (!rawBase64) throw new Error("No audio data");
-          const base64 = toBase64Standard(rawBase64);
-          const id = uuidv4(); const ext = mimeToExt(mime);
-          const filename = `audio/${id}.${ext}`;
-          await Filesystem.writeFile({ path: filename, directory: Directory.Data, data: base64, recursive: true });
-          const fileUri = await Filesystem.getUri({ path: filename, directory: Directory.Data });
-          const webPath = Capacitor.convertFileSrc(fileUri.uri);
-          const note: Note = { id, filePath: filename, webPath, createdAt: new Date().toISOString(), lat: positionRef.current?.lat ?? 0, lon: positionRef.current?.lon ?? 0, label: new Date().toLocaleString(), durationMs: ms ?? elapsed, mimeType: mime };
-          const existing = await readNotes(); await writeNotes([note, ...existing]); setUiStatus("SAVED"); setStatus("Saved"); onSaved(note); setTimeout(() => setStatus(null), 1200);
-          return;
-        } catch (e: any) {
-          dbgIOS("stopRecording error", e); setIsRecording(false); setUiStatus("FAILED_TO_RECORD"); setStatus(e?.message || "IOS_STOP_ERROR"); return;
-        }
-      }
-
       if (IS_WEB) {
         const mr = mediaRecorderRef.current; if (!mr) throw new Error("No recorder");
-        const finished = new Promise<Blob>((resolve) => { mr.onstop = () => resolve(new Blob(mediaChunksRef.current, { type: mimeTypeRef.current || "audio/webm" })); });
-        mr.stop(); const blob = await finished; mediaStreamRef.current?.getTracks().forEach((t) => t.stop()); mediaRecorderRef.current = null; mediaStreamRef.current = null;
-        await persistBlobAsNote(blob, elapsed, positionRef.current, onSaved); setIsRecording(false); setUiStatus("SAVED"); setStatus("Saved"); setTimeout(() => setStatus(null), 1200);
+        const finished = new Promise<Blob>((resolve) => { mr.onstop = () => resolve(new Blob(mediaChunksRef.current, { type: "audio/webm" })); });
+        mr.stop(); const blob = await finished;
+        mediaStreamRef.current?.getTracks().forEach((t) => t.stop()); mediaRecorderRef.current = null; mediaStreamRef.current = null;
+
+        const arrayBuffer = await blob.arrayBuffer(); const base64 = arrayBufferToBase64(arrayBuffer);
+        const id = uuidv4(); const filename = `audio/${id}.webm`;
+        await Filesystem.writeFile({ path: filename, directory: Directory.Data, data: base64, recursive: true });
+
+        const webPath = URL.createObjectURL(blob); // reliable playback in web
+        const note: Note = { id, filePath: filename, webPath, createdAt: new Date().toISOString(), lat: positionRef.current?.lat ?? 0, lon: positionRef.current?.lon ?? 0, label: new Date().toLocaleString(), durationMs: elapsed, mimeType: "audio/webm" };
+        const existing = await readNotes(); await writeNotes([note, ...existing]); onSaved(note);
+        setIsRecording(false); setUiStatus("SAVED"); setStatus("Saved"); setTimeout(() => setStatus(null), 1200);
         return;
       }
 
-      // Android native
+      // Native
       const result = await VoiceRecorder.stopRecording(); setIsRecording(false);
-      const rawBase64 = result?.value?.recordDataBase64; const ms = result?.value?.msDuration as number | undefined; const mime = (result?.value?.mimeType as string | undefined) || "audio/m4a";
-      if (!rawBase64) throw new Error("No audio data"); const base64 = toBase64Standard(rawBase64); const id = uuidv4(); const ext = mimeToExt(mime);
-      const filename = `audio/${id}.${ext}`; await Filesystem.writeFile({ path: filename, directory: Directory.Data, data: base64, recursive: true }); const fileUri = await Filesystem.getUri({ path: filename, directory: Directory.Data }); const webPath = Capacitor.convertFileSrc(fileUri.uri);
-      const note: Note = { id, filePath: filename, webPath, createdAt: new Date().toISOString(), lat: positionRef.current?.lat ?? 0, lon: positionRef.current?.lon ?? 0, label: new Date().toLocaleString(), durationMs: ms ?? elapsed, mimeType: mime }; const existing = await readNotes(); await writeNotes([note, ...existing]); onSaved(note); setUiStatus("SAVED"); setStatus("Saved"); setTimeout(() => setStatus(null), 1200);
-    } catch (err: any) { setIsRecording(false); setUiStatus("FAILED_TO_RECORD"); setStatus(err?.message || "FAILED_TO_RECORD"); setTimeout(() => setStatus(null), 1800); }
-  };
+      const rawBase64 = result?.value?.recordDataBase64; const ms = result?.value?.msDuration as number | undefined; const mime = (result?.value?.mimeType as string | undefined) || "audio/m4a"; if (!rawBase64) throw new Error("No audio data");
+      const base64 = toBase64Standard(rawBase64); const id = uuidv4(); const ext = mimeToExt(mime); const filename = `audio/${id}.${ext}`;
+      await Filesystem.writeFile({ path: filename, directory: Directory.Data, data: base64, recursive: true });
+      const fileUri = await Filesystem.getUri({ path: filename, directory: Directory.Data }); const webPath = Capacitor.convertFileSrc(fileUri.uri);
 
-  async function persistBlobAsNote(blob: Blob, elapsedMs: number, pos: {lat:number;lon:number} | null, onSavedCb: (n: Note)=>void) {
-    const arrayBuffer = await blob.arrayBuffer(); const base64 = arrayBufferToBase64(arrayBuffer); const id = uuidv4(); const ext = mimeToExt(blob.type);
-    const filename = `audio/${id}.${ext}`; await Filesystem.writeFile({ path: filename, directory: Directory.Data, data: base64, recursive: true }); const webPath = `data:${blob.type};base64,${base64}`;
-    const note: Note = { id, filePath: filename, webPath, createdAt: new Date().toISOString(), lat: pos?.lat ?? 0, lon: pos?.lon ?? 0, label: new Date().toLocaleString(), durationMs: elapsedMs, mimeType: blob.type };
-    const existing = await readNotes(); await writeNotes([note, ...existing]); onSavedCb(note);
-  }
-
-  // Diagnostics panel
-  const runNativeSmokeTest = async () => {
-    try {
-      const available = (Capacitor as any).isPluginAvailable?.("VoiceRecorder") ?? false;
-      setStatus(`SMOKE: plugin=${available}`);
-      if (!available) { setUiStatus("FAILED_TO_RECORD"); setStatus("SMOKE_FAIL: PLUGIN_NOT_LINKED"); return; }
-      const has = await VoiceRecorder.hasAudioRecordingPermission(); if (!has.value) { const asked = await VoiceRecorder.requestAudioRecordingPermission(); if (!asked.value) { setStatus("SMOKE_FAIL: MIC_DENIED"); return; } }
-      dbgIOS("SMOKE start →"); await VoiceRecorder.startRecording(); setStatus("SMOKE: recording 1s…"); await new Promise(r=>setTimeout(r, 1200));
-      const res = await VoiceRecorder.stopRecording(); dbgIOS("SMOKE stop ←", res);
-      const base = res?.value?.recordDataBase64; const ms = res?.value?.msDuration; const mime = res?.value?.mimeType; setStatus(`SMOKE_OK ms=${ms} mime=${mime} has=${!!base}`);
-    } catch (e: any) {
-      dbgIOS("SMOKE error", e); setStatus(`SMOKE_ERR: ${e?.message || e}`);
+      const note: Note = { id, filePath: filename, webPath, createdAt: new Date().toISOString(), lat: positionRef.current?.lat ?? 0, lon: positionRef.current?.lon ?? 0, label: new Date().toLocaleString(), durationMs: ms ?? elapsed, mimeType: mime };
+      const existing = await readNotes(); await writeNotes([note, ...existing]); onSaved(note);
+      setUiStatus("SAVED"); setStatus("Saved"); setTimeout(() => setStatus(null), 1200);
+    } catch (err) {
+      setIsRecording(false); setUiStatus("FAILED_TO_RECORD"); setStatus("FAILED_TO_RECORD"); setTimeout(() => setStatus(null), 1800);
     }
   };
 
-  const requestMic = async () => {
-    try { const asked = await VoiceRecorder.requestAudioRecordingPermission(); setStatus(`PERM: asked=${asked.value}`); } catch (e: any) { setStatus(`PERM_ERR: ${e?.message || e}`); }
-  };
+  // Circle record button — responsive (64vw, capped)
+  const sizeStyle: React.CSSProperties = { width: "min(64vw, 18rem)", height: "min(64vw, 18rem)" };
+  const baseBtn = "rounded-full flex items-center justify-center shadow-xl transition active:scale-95 border";
+  const idle = "bg-neutral-800 border-neutral-700 text-neutral-100 hover:bg-neutral-700 ring-4 ring-neutral-700/40";
+  const rec  = "bg-red-600 border-red-500 text-white animate-pulse ring-8 ring-red-500/30";
 
   return (
-    <Screen title="New Voice Memo" debugLine={debugLine}>
-      <div className="text-xs text-neutral-400">{uiStatus === "RECORDING" ? "Recording…" : uiStatus === "FAILED_TO_RECORD" ? (status || "FAILED_TO_RECORD") : status || ""}</div>
-      <button onClick={isRecording ? stop : start} className={`w-40 h-40 rounded-full flex items-center justify-center shadow-xl transition active:scale-95 border ${isRecording ? "bg-red-600 border-red-500 text-white" : "bg-neutral-800 border-neutral-700 text-neutral-100"}`}>
-        <div className="text-lg font-semibold">{isRecording ? "Stop" : "Record"}</div>
+    <div className="h-full flex flex-col items-center justify-center gap-4 p-4">
+      <div className="text-xs text-neutral-400">{uiStatus === "RECORDING" ? "Recording…" : uiStatus === "FAILED_TO_RECORD" ? "FAILED_TO_RECORD" : status || ""}</div>
+      <button onClick={isRecording ? stop : start} className={`${baseBtn} ${isRecording ? rec : idle}`} style={sizeStyle} aria-label={isRecording ? "Stop recording" : "Start recording"}>
+        <div className="text-lg font-semibold tracking-wide">{isRecording ? "Stop" : "Record"}</div>
       </button>
       <div className="h-6 text-sm text-neutral-400">{isRecording ? msToClock(elapsed) : ""}</div>
-
-      {/* Diagnostics toggle */}
-      <button onClick={() => setShowDiag(s => !s)} className="text-xs text-neutral-400 underline">{showDiag ? "Hide diagnostics" : "Show diagnostics"}</button>
-      {showDiag && (
-        <div className="w-full max-w-sm text-xs text-neutral-300 bg-neutral-900 border border-neutral-800 rounded-lg p-3 space-y-2">
-          <div>Build: {BUILD_SENTINEL} · {BUILD_TIME}</div>
-          <div>Platform: {PLATFORM}</div>
-          <div className="flex gap-2">
-            <button onClick={requestMic} className="px-2 py-1 rounded border border-neutral-700">Ask Mic</button>
-            <button onClick={runNativeSmokeTest} className="px-2 py-1 rounded border border-neutral-700">Native 1s Smoke</button>
-          </div>
-          <div className="text-neutral-400">Watch Xcode for [DEBUG][iOS] logs.</div>
-        </div>
-      )}
-    </Screen>
+    </div>
   );
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Map View (unchanged)
+// Map View (fills all space in the content row)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const Recenter: React.FC<{ lat: number; lon: number }> = ({ lat, lon }) => { const map = useMap(); useEffect(() => { map.setView([lat, lon]); }, [lat, lon]); return null; };
@@ -327,16 +256,20 @@ const FitBounds: React.FC<{ points: [number, number][] }> = ({ points }) => { co
 const MapView: React.FC<{ notes: Note[] }> = ({ notes }) => {
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
   useEffect(() => { (async () => { try { const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true }); setCoords({ lat: pos.coords.latitude, lon: pos.coords.longitude }); } catch { setCoords(null); } })(); }, []);
+
   const located = useMemo(() => notes.filter(n => !(n.lat === 0 && n.lon === 0)), [notes]);
   const unlocated = useMemo(() => notes.filter(n => (n.lat === 0 && n.lon === 0)), [notes]);
   const center = useMemo<[number, number]>(() => { if (coords) return [coords.lat, coords.lon]; if (located.length > 0) return [located[0].lat, located[0].lon]; return [42.2808, -83.743]; }, [coords, located]);
+
   const onPlay = (note: Note) => { if (!audioRef.current) return; const a = audioRef.current; a.pause(); a.src = note.webPath; a.currentTime = 0; a.load(); a.play().catch(err => console.warn('play failed:', err)); };
+
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-50 flex flex-col">
-      <header className="p-4 text-center font-medium text-neutral-200 tracking-wide">Your Memos</header>
-      <div className="flex-1 relative">
-        <MapContainer center={[42.2808, -83.743]} zoom={13} style={{height:'70vh', width:'100%'}}>
+    <div className="h-full relative">
+      {/* Map fills the entire content row */}
+      <div className="absolute inset-0">
+        <MapContainer center={center} zoom={13} className="h-full w-full">
           <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
           <Recenter lat={center[0]} lon={center[1]} />
           {located.length > 0 && (<FitBounds points={located.map(n => [n.lat, n.lon]) as [number, number][]} />)}
@@ -350,30 +283,50 @@ const MapView: React.FC<{ notes: Note[] }> = ({ notes }) => {
             </Marker>
           ))}
         </MapContainer>
-        {unlocated.length > 0 && (
-          <div className="absolute left-3 right-3 bottom-20 bg-neutral-900/90 border border-neutral-700 rounded-xl p-3 text-sm">
-            <div className="mb-2">Saved {unlocated.length} memo{unlocated.length>1?'s':''} without location. They won't show on the map until location is allowed. You can still play them here:</div>
-            <div className="flex gap-2 flex-wrap">{unlocated.slice(0, 5).map((n) => (<button key={n.id} onClick={() => onPlay(n)} className="px-3 py-1 rounded border border-neutral-700 hover:bg-neutral-800">{n.label || new Date(n.createdAt).toLocaleString()}</button>))}</div>
-          </div>
-        )}
-        <audio ref={audioRef} preload="none" />
       </div>
+
+      {/* Quick access for notes without location (optional, sits above map) */}
+      {unlocated.length > 0 && (
+        <div className="absolute left-3 right-3 bottom-3 bg-neutral-900/90 border border-neutral-700 rounded-xl p-3 text-sm">
+          <div className="mb-2">Saved {unlocated.length} memo{unlocated.length>1?'s':''} without location. You can still play them here:</div>
+          <div className="flex gap-2 flex-wrap">{unlocated.slice(0, 5).map((n) => (<button key={n.id} onClick={() => onPlay(n)} className="px-3 py-1 rounded border border-neutral-700 hover:bg-neutral-800">{n.label || new Date(n.createdAt).toLocaleString()}</button>))}</div>
+        </div>
+      )}
+
+      <audio ref={audioRef} preload="none" />
     </div>
   );
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// App Shell
+// App Shell — 3-row grid (header | content | tab bar) using true device height
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function App() {
+  useAppHeight(); // ensures --app-height is accurate on older iOS
+
   const [tab, setTab] = useState<"record" | "map">("record");
   const [notes, setNotes] = useState<Note[]>([]);
+
   useEffect(() => { (async () => { const n = await readNotes(); setNotes(n); })(); }, []);
   const handleSaved = (note: Note) => setNotes((p) => [note, ...p]);
+
   return (
-    <div className="relative min-h-screen bg-neutral-950">
-      {tab === "record" ? <RecordView onSaved={handleSaved} /> : <MapView notes={notes} />}
+    <div
+      className="grid bg-neutral-950 text-neutral-50"
+      style={{ minHeight: "var(--app-height)", gridTemplateRows: "auto 1fr auto" }}
+    >
+      <Header title={tab === "record" ? "New Voice Memo" : "Your Memos"} />
+
+      {/* Content row fills the remaining space exactly */}
+      <main className="relative overflow-hidden">
+        {tab === "record" ? (
+          <RecordView onSaved={handleSaved} />
+        ) : (
+          <MapView notes={notes} />
+        )}
+      </main>
+
       <TabBar tab={tab} onChange={setTab} />
     </div>
   );
